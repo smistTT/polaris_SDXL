@@ -2119,6 +2119,47 @@ class GeluOp(SimOp):
         else:
             return {}
 
+class SiLUOp(SimOp):
+    def __init__(self, opinfo):
+        super().__init__(opinfo)
+        self.opclass_str: str = 'SiLU'
+        check_io_counts( self, in_counts=[1,1], out_counts=[1,1] )
+
+    def get_perf_counts(self, inT, outT, **kwargs):
+        if self.perf_stats is not None:
+            return self.perf_stats
+        # SiLU (Sigmoid Linear Unit) activation function: Y = X * sigmoid(X)
+        # sigmoid(X) = 1 / (1 + exp(-X))
+        # So Y = X / (1 + exp(-X))
+
+        outT[0].shape = inT[0].shape
+        outT[0].dtype = inT[0].dtype
+        #instr count calc.
+        # Y = X * sigmoid(X) = X / (1 + exp(-X))
+        nElem = inT[0].nelems()
+        mul_count, add_count, exp_count, div_count = 0,0,0,0
+        mul_count  += nElem     # -X (negate)
+        exp_count  += nElem     # exp(-X)
+        add_count  += nElem     # 1 + exp(-X)
+        div_count  += nElem     # 1 / (1 + exp(-X)) = sigmoid(X)
+        mul_count  += nElem     # X * sigmoid(X)
+        instr = {'mul': mul_count, 'add': add_count, 'exp': exp_count, 'div': div_count}
+
+        self.perf_stats = {
+                'inElems' : inT[0].nelems(),
+                'inBytes' : inT[0].nbytes(self.precision),
+                'outElems': outT[0].nelems(),
+                'outBytes': outT[0].nbytes(self.precision),
+                'instrs'  : instr
+                }
+        return self.perf_stats
+
+    def backward(self, inT, outT, inGT, outGT):
+        # SiLU derivative: d/dx[x * sigmoid(x)] = sigmoid(x) + x * sigmoid(x) * (1 - sigmoid(x))
+        # For simplicity in TTSIM, we'll skip the gradient implementation
+        # since this is primarily for performance analysis
+        return {}
+
 class ReluOp(SimOp):
     def __init__(self, opinfo):
         super().__init__(opinfo)
@@ -2408,25 +2449,105 @@ class ReduceSumOp(SimOp):
 
         return self.perf_stats
 
-class ReduceMaxOp(SimOp):
+class ReduceOp(SimOp):
     def __init__(self, opinfo):
         super().__init__(opinfo)
-        self.opclass_str: str = 'ReduceMax'
+        self.opclass_str: str = 'Reduce'
         check_io_counts(self, in_counts=[1,2], out_counts=[1,1])
-        #self._kw_args_defaults = { 'keepdims': 1, 'noop_with_empty_axes': 0 }
-        #if 'attrs' in opinfo:
-        #    self.check_known_args(opinfo['attrs'])
 
     def get_perf_counts(self, inT, outT, **kwargs):
         if self.perf_stats is not None:
             return self.perf_stats
 
+        keepdims = self.attrs.get('keepdims', 1)
+        noop     = self.attrs.get('noop_with_empty_axes', 0)
+        dataT    = clone_tensor_by_shape(inT[0])
+        axesT    = clone_tensor_by_shape(inT[1], data_maybe_missing=False) if len(inT) == 2 else None
+        rank     = dataT.rank()
+        if axesT is None:
+            if noop:
+                outShape = dataT.shape
+                reduce_axes = None
+            else:
+                reduce_axes = [i for i in range(rank)]
+        else:
+            reduce_axes = [i for i in axesT.data]
+
+        if reduce_axes:
+            normalized_axes = []
+            for a in reduce_axes:
+                if a < 0: a += rank
+                assert (0 <= a < rank), f"reduce axis {a} out of range for rank {rank}"
+                normalized_axes.append(a)
+            axes_set = sorted(set(normalized_axes))
+
+            if keepdims:
+                outShape = [1 if i in axes_set else d for i,d in enumerate(dataT.shape)]
+            else:
+                outShape = [d for i,d in enumerate(dataT.shape) if i not in axes_set]
+
+
+        inelems = dataT.nelems()
+        instr_profile = {
+                'ReduceL1'        : {'abs': inelems, 'sum': inelems},
+                'ReduceL2'        : {'mul': inelems, 'sum': inelems, 'sqrt': 1},
+                'ReduceLogSum'    : {'log': inelems, 'sum': inelems},
+                'ReduceLogSumExp' : {'log': inelems, 'sum': inelems, 'exp': 1},
+                'ReduceMax'       : {'cmp': inelems},
+                'ReduceMean'      : {'sum': inelems, 'div': 1},
+                'ReduceMin'       : {'cmp': inelems},
+                'ReduceProd'      : {'mul': inelems},
+                'ReduceSum'       : {'sum': inelems},
+                'ReduceSumSquare' : {'mul': inelems, 'sum': inelems},
+                }
+
+        outT[0].shape = outShape
+        outT[0].dtype = dataT.dtype
         self.perf_stats = {
                 'inElems' : sum([x.nelems() for x in inT]),
                 'inBytes' : sum([x.nbytes(self.precision) for x in inT]),
                 'outElems': outT[0].nelems(),
                 'outBytes': outT[0].nbytes(self.precision),
-                'instrs'  : {'max': outT[0].nelems()}
+                'instrs'  : instr_profile[self.optype]
+                }
+
+        return self.perf_stats
+
+class ArgMaxMinOp(SimOp):
+    def __init__(self, opinfo):
+        super().__init__(opinfo)
+        self.opclass_str: str = 'ArgMaxMin'
+        check_io_counts(self, in_counts=[1,1], out_counts=[1,1])
+
+    def get_perf_counts(self, inT, outT, **kwargs):
+        if self.perf_stats is not None:
+            return self.perf_stats
+
+        #select_last_index = self.attrs.get('select_last_index', 0) -- has no effect on outshape!!
+        keepdims = self.attrs.get('keepdims', 1)
+        axis     = self.attrs.get('axis',     0)
+        dataT    = clone_tensor_by_shape(inT[0])
+        rank     = dataT.rank()
+        if axis < 0: axis += rank
+        assert (0 <= axis < rank), f"Arg axis {axis} out of range for rank {rank}"
+
+        if keepdims:
+            outShape = [i for i in dataT.shape]
+            outShape[axis] = 1
+        else:
+            outShape = [d for i,d in enumerate(dataT.shape) if i != axis]
+
+        outT[0].shape = outShape
+        #outT[0].dtype = np.dtype(np.int64)
+        #create dummy index data so that it can work downstream...
+        outT[0].data  = np.array([0 for i in range(outT[0].rank())], dtype=np.int64)
+        outT[0].dtype = outT[0].data.dtype
+        self.perf_stats = {
+                'inElems' : dataT.nelems(),
+                'inBytes' : dataT.nbytes(),
+                'outElems': outT[0].nelems(),
+                'outBytes': outT[0].nbytes(self.precision),
+                'instrs'  : {'cmp': dataT.nelems()}
                 }
 
         return self.perf_stats
@@ -2531,6 +2652,96 @@ class VoxelPoolingOp(SimOp):
 
         return self.perf_stats
 
+class GroupNormalizationOp(SimOp):
+    def __init__(self, opinfo):
+        super().__init__(opinfo)
+        self.opclass_str: str = 'GroupNorm'
+        check_io_counts(self, in_counts=[2,3], out_counts=[1,1])
+
+    def get_perf_counts(self, inT, outT, **kwargs):
+        if self.perf_stats is not None:
+            return self.perf_stats
+
+        is_backprop = kwargs.get('is_backprop', False)
+        assert is_backprop == False, f"GroupNormalization cannot be a backward op!!"
+
+        num_groups = self.attrs.get('num_groups', 1)
+        epsilon = self.attrs.get('epsilon', 1e-5)
+
+        X = inT[0]
+        scaleT = inT[1]
+        biasT = inT[2] if len(inT) == 3 else None
+        
+        assert X.check_shape(), f"Illegal Shape for {X}"
+        XShape = X.shape
+        XRank = X.rank()
+        
+        # GroupNormalization implementation following ONNX spec
+        # From Spec: https://github.com/onnx/onnx/blob/main/docs/Operators.md#GroupNormalization
+        # GroupNorm applies normalization over groups of channels.
+        # Input shape: (N, C, spatial_dims...)
+        # For each group: mean and variance are computed over group channels and spatial dimensions
+        
+        assert XRank >= 2, f"GroupNorm requires at least 2D tensor, got {XRank}D"
+        assert len(XShape) >= 2, f"Input must have shape (N, C, ...), got {XShape}"
+        
+        batch_size = XShape[0]
+        num_channels = XShape[1]
+        assert num_channels % num_groups == 0, f"num_channels ({num_channels}) must be divisible by num_groups ({num_groups})"
+        
+        channels_per_group = num_channels // num_groups
+        
+        # Calculate spatial dimensions
+        spatial_dims = XShape[2:] if XRank > 2 else [1]
+        spatial_size = reduce(operator.mul, spatial_dims, 1)
+        
+        input_count = X.nelems()
+        group_size = channels_per_group * spatial_size
+        
+        instr_count = {'add': 0, 'sub': 0, 'mul': 0, 'div': 0, 'mac': 0, 'rsqrt': 0}
+        
+        # GroupNorm computation for each group:
+        # 1. Compute mean and variance for each group
+        # 2. Normalize: (x - mean) / sqrt(var + eps)
+        # 3. Apply scale and bias
+        
+        # Stage 1: Compute mean for each group
+        # Mean computation: sum over group channels and spatial dims, then divide
+        instr_count['add'] += input_count  # sum operations
+        instr_count['div'] += batch_size * num_groups  # mean computation
+        
+        # Stage 2: Compute variance for each group
+        # (x - mean)^2 for each element
+        instr_count['sub'] += input_count  # x - mean
+        instr_count['mul'] += input_count  # (x - mean)^2
+        instr_count['add'] += input_count  # sum for variance
+        instr_count['div'] += batch_size * num_groups  # variance computation
+        
+        # Stage 3: Normalization
+        instr_count['add'] += batch_size * num_groups  # var + epsilon
+        instr_count['rsqrt'] += batch_size * num_groups  # 1/sqrt(var + eps)
+        instr_count['mul'] += input_count  # (x - mean) * inv_std
+        
+        # Stage 4: Scale and bias
+        instr_count['mac'] += input_count  # scale * normalized + bias (if bias exists)
+        
+        # Set output tensor properties
+        outT[0].shape = X.shape
+        outT[0].dtype = X.dtype
+        
+        # Calculate element and byte counts
+        biasElems = 0 if biasT is None else biasT.nelems()
+        biasBytes = 0 if biasT is None else biasT.nbytes(self.precision)
+        
+        self.perf_stats = {
+            'inElems': inT[0].nelems() + inT[1].nelems() + biasElems,
+            'outElems': outT[0].nelems(),
+            'inBytes': inT[0].nbytes(self.precision) + inT[1].nbytes(self.precision) + biasBytes,
+            'outBytes': outT[0].nbytes(self.precision),
+            'instrs': instr_count
+        }
+        return self.perf_stats
+
 
 ######################  CONCRETE OP IMPLEMENTATION END ##################
 
@@ -2566,6 +2777,7 @@ def SimOpFactory(optype: str) -> type[SimOp]:
             ConstantOp           : ['Constant'],
             GatherOp             : ['Gather'],
             LayerNormalizationOp : ['LayerNormalization'],
+            GroupNormalizationOp : ['GroupNormalization'],
             MatMulOp             : ['MatMul'],
             SplitOp              : ['Split'],
             ReshapeOp            : ['Reshape'],
@@ -2585,11 +2797,15 @@ def SimOpFactory(optype: str) -> type[SimOp]:
             ShapeOp              : ['Shape'],
             RangeOp              : ['Range'],
             GeluOp               : ['Gelu'],
+            SiLUOp               : ['SiLU'],
             ReluOp               : ['Relu'],
+            ReduceOp             : ['ReduceL1', 'ReduceL2', 'ReduceLogSum', 'ReduceLogSumExp',
+                                    'ReduceMax', 'ReduceMean', 'ReduceMin', 'ReduceProd',
+                                    'ReduceSum', 'ReduceSumSquare'],
+            ArgMaxMinOp          : ['ArgMax', 'ArgMin'],
             LeakyReluOp          : ['LeakyRelu'], #Yolo-v7
             SigmoidOp            : ['Sigmoid'], #Yolo-v7
             ResizeOp             : ['Resize'], #Yolo-v7
-            ReduceMaxOp          : ['ReduceMax', 'ArgMax'], #Yolo-v7
             NonMaxSuppressionOp  : ['NonMaxSuppression'], #Yolo-v7
             FlattenOp            : ['Flatten'], #Yolo-v7
             VoxelPoolingOp       : ['VoxelPooling'], #BEVDepth
